@@ -36,13 +36,13 @@ export function attachWalletListeners(
   provider.on?.("disconnect", onDisconnect);
 
   // Some providers also emit "session_delete" or "close" (WalletConnect variants)
-  provider.on?.("close", onDisconnect);
+  provider.on?.("disconnect", onDisconnect);
 
   return () => {
     provider.removeListener?.("accountsChanged", onAccountsChanged);
     provider.removeListener?.("chainChanged", onChainChanged);
     provider.removeListener?.("disconnect", onDisconnect);
-    provider.removeListener?.("close", onDisconnect);
+    provider.removeListener?.("disconnect", onDisconnect);
   };
 }
 

