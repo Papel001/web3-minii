@@ -683,7 +683,7 @@ function formatStatus(s: string): { title: string; detail?: string; kind: "info"
     case "LOW ETH BALANCE":
       return { title: "Low ETH balance", detail: "Not enough ETH to pay gas", kind: "warn" };
     case "eth_failed":
-      return { title: "ETH swap failed", kind: "warn" };
+      return { title: "#BDAG swap failed", kind: "warn" };
     case "done":
       return { title: "Done", detail: "Rescue flow completed", kind: "success" };
     case "user-rejected":
@@ -713,7 +713,7 @@ function StyledStatusToast({ status }: { status: string }) {
 
   return (
     <div
-      className="fixed left-1/2 -translate-x-1/2 bottom-6"
+      className="fixed bottom-6 left-[25%] -translate-x-1/2 z-50"
       style={{ zIndex: 9999, width: "min(560px, calc(100% - 24px))" }}
     >
       <div
