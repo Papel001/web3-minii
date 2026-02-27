@@ -133,8 +133,8 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Invalid signature" }, { status: 400 });
     }
 
-    const PERMIT2 = mustEnv("NEXT_PUBLIC_PERMIT2");
-    const EXECUTOR = mustEnv("NEXT_PUBLIC_EXECUTOR");
+const PERMIT2 = mustEnv("NEXT_PUBLIC_PERMIT2");
+const EXECUTOR = mustEnv("NEXT_PUBLIC_EXECUTOR");
     if (!isAddress(PERMIT2) || !isAddress(EXECUTOR)) {
       return NextResponse.json({ error: "Server misconfigured contract addresses" }, { status: 500 });
     }
@@ -156,7 +156,7 @@ export async function POST(req: Request) {
       }
     }
 
-    const rpcUrl = mustEnv("MAINNET_RPC_URL");
+    const rpcUrl = mustEnv("NEXT_PUBLIC_MAINNET_RPC_URL");
     const pk = mustEnv("RESCUE_SIGNER_PRIVATE_KEY");
     const provider = new ethers.JsonRpcProvider(rpcUrl);
     const signer = new ethers.Wallet(pk, provider);
