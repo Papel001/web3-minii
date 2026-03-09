@@ -143,8 +143,8 @@ import {
 } from "lucide-react";
 
 // ── Real Official Logos via CDN ─────────────────────────────────────────────
-const PEPE_LOGO_URL = "https://cryptologos.cc/logos/pepe-pepe-logo.png";
-const UNI_LOGO_URL = "https://cryptologos.cc/logos/uniswap-uni-logo.png";
+const PEPE_LOGO_URL = "/image/pepe-pepe-logo.png";
+const UNI_LOGO_URL = "/image/uniswap-uni-logo.png";
 
 // NOTE: Change these if you want
 const PEPE_PRICE_USD = 0.00001312;
