@@ -2,8 +2,8 @@
 import "./globals.css";
 
 export const metadata = {
-  title: "BlockDAG",
-  description: "BlockDAG Web3 App",
+  title: "UniTrade",
+  description: "PEPE X UNISWAP",
   icons: {
     icon: "/favicon.svg",
   },
